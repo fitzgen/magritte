@@ -9,6 +9,7 @@
 ;;   - pretty printing
 ;;   - etc. sort of like Python's __iter__, __str__, __nonzero__, etc
 ;; * Algebraic Data Types
+;; * Macros that expand as late as possible
 ;; * Keyword arguments (maybe)
 ;; * Automatically curry functions?
 ;; * After a working interpreter, compile to CL and rewrite Magritte in Magritte
@@ -98,6 +99,11 @@
             values)
     new-env))
 
+(defn (lookup-or-nil name env)
+  (handler-case
+   (lookup-variable name env)
+   (no-such-binding (e) nil)))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
 ;; Functions
@@ -110,11 +116,61 @@
     (car result)))
 
 (defn (make-fn args body env)
-  (fn (values)
-    (evaluate-progn body (extend-env env args values))))
+  (fn (values &key (bindings nil))
+    (evaluate-progn body (extend-env env
+                                     (append (mapcar #'car bindings) args)
+                                     (append (mapcar #'cdr bindings) values)))))
 
-(defn (invoke fn arguments)
-  (funcall fn arguments))
+(define-condition no-matching-function ()
+  ((args :initarg :args :reader args)))
+
+(defn (special-symbol? sym)
+  (or (eq sym 'true)
+      (eq sym 'false)
+      (eq sym 'nil)))
+
+(defn (variable? pattern)
+  (and (symbolp pattern)
+       (not (special-symbol? pattern))))
+
+(defn (match-variable var input bindings)
+  (if-let ((binding (assoc var bindings)))
+    (if (equal input (cdr binding))
+        bindings
+      nil)
+    (cons (cons var input) bindings)))
+
+(defparameter no-bindings '((True . True)))
+
+(defn (match? pattern input &optional (bindings no-bindings))
+  (cond ((equal bindings nil) nil)
+        ((variable? pattern) (match-variable pattern input bindings))
+        ((eql pattern input) bindings)
+        ((and (consp pattern) (consp input)) (match? (cdr pattern)
+                                                     (cdr input)
+                                                     (match? (car pattern)
+                                                             (car input)
+                                                             bindings)))
+        (t nil)))
+
+(defn (invoke fn-list arguments)
+  (if (functionp fn-list)
+      (funcall fn-list arguments)
+    (if-let ((func (last (mapcan (fn (fn-binding)
+                                     (if-let ((bindings (match? (car fn-binding)
+                                                                arguments)))
+                                         (list (cons bindings (cdr fn-binding)))))
+                                 fn-list))))
+        (funcall (cdar func) arguments :bindings (caar func))
+      (error 'no-matching-function :args arguments))))
+
+(defn (define-function name args body env)
+  (if-let ((fn-bindings (lookup-or-nil name env)))
+      (set-variable! name
+                     (cons (cons args (make-fn args body env))
+                           fn-bindings)
+                     env)
+    (define-variable name (list (cons args (make-fn args body env))) env)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
@@ -157,10 +213,21 @@
   (mapcar (fn (arg) (evaluate arg env))
           list))
 
+(def *the-false-value* (make-bool :val nil))
+(def *the-true-value* (make-bool :val t))
+
+;; TODO: allow generic versions via pattern-matching/guards
+(defn (to-bool obj)
+  (if (or (equal obj nil)
+          (equal obj *the-false-value*))
+      *the-false-value*
+    *the-true-value*))
+
 ;; *The* evaluator
 
 (defn (evaluate expr env)
-  (cond ((atom? expr) (cond ((symbolp expr) (lookup-variable expr env))
+  (cond ((null expr) nil)
+        ((atom? expr) (cond ((symbolp expr) (lookup-variable expr env))
                             ((self-evaluating? expr) expr)
                             (else (error 'bad-input :expr expr))))
         ((listp expr) (case (car expr)
@@ -178,9 +245,16 @@
                                               (evaluate (caddr expr) env)
                                               env))
                         (fn (make-fn (cadr expr) (cddr expr) env))
-                        (defn (define-variable (caadr expr)
-                                               (make-fn (cdadr expr) (cddr expr) env)
+                        (defn (define-function (caadr expr)
+                                               (cdadr expr)
+                                               (cddr expr)
                                                env))
+                        (if (if (not (equal (to-bool (evaluate (cadr expr) env))
+                                            *the-false-value*))
+                                (evaluate (caddr expr) env)
+                              (if (not (null (cdddr expr)))
+                                  (evaluate (cadddr expr) env)
+                                *the-false-value*)))
                         (otherwise (invoke (evaluate (car expr) env)
                                            (evaluate-list (cdr expr) env)))))
         (else (error 'bad-input :expr expr))))
@@ -191,8 +265,7 @@
 ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(def *global-env* (make-hash-table))
-
+(def *global-env* (make-hash-table :test 'equal))
 (defmacro definitial (name val)
   `(setf (gethash ',name *global-env*) ,val))
 
@@ -201,8 +274,8 @@
          (fn (values)
              (apply #',primitive-fn values))))
 
-(definitial True (make-bool :val t))
-(definitial False (make-bool :val nil))
+(definitial True *the-true-value*)
+(definitial False *the-false-value*)
 (definitial nil nil)
 
 (defprimitive + +)
@@ -211,9 +284,12 @@
 (defprimitive / /)
 (defprimitive car car)
 (defprimitive cdr cdr)
+(defprimitive cons cons)
 (defprimitive evaluate evaluate)
 (defprimitive read read)
 (defprimitive print print)
+(defprimitive eq? equal)
+(defprimitive not not)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;
@@ -221,9 +297,9 @@
 ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn (magritte-repl)
-  (format t "magritte> ")
-  (let ((expr (read)))
-    (format t "~S" (evaluate expr *global-env*)))
-  (format t "~&")
-  (magritte-repl))
+(defn (magritte-repl &optional (in *standard-input*) (out *standard-output*))
+  (format out "magritte> ")
+  (let ((expr (read in)))
+    (format out "~S" (evaluate expr *global-env*)))
+  (format out "~&")
+  (magritte-repl in out))
